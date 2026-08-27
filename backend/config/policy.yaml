@@ -1,0 +1,54 @@
+policy_version: v0.1-demo
+
+# Illustrative prototype policy thresholds — not production risk calibration (§6)
+
+customer_facing_chatbot:
+  risk_tolerance: low
+  latency_budget_ms: 300
+  evaluation_depth: fast
+  enabled_evaluators: [pii, safety, injection]
+  low_confidence_action: edit_soften
+  human_review_threshold: 0.65
+  block_threshold: 0.85
+  session_risk_threshold: 0.70
+  decay_factor: 0.6
+  risk_weight: 0.7
+  safety_floor: true
+  safety_floor_confidence_threshold: 0.80
+  safety_floor_categories:
+    - credential_exposure
+    - prohibited_unsafe_content
+
+internal_copilot:
+  risk_tolerance: medium
+  latency_budget_ms: 1500
+  evaluation_depth: standard
+  enabled_evaluators: [pii, safety, groundedness]
+  low_confidence_action: allow_with_flag
+  human_review_threshold: 0.80
+  block_threshold: 0.90
+  session_risk_threshold: 0.75
+  decay_factor: 0.6
+  risk_weight: 0.7
+  safety_floor: true
+  safety_floor_confidence_threshold: 0.80
+  safety_floor_categories:
+    - credential_exposure
+    - prohibited_unsafe_content
+
+regulated_decision_support:
+  risk_tolerance: very_low
+  latency_budget_ms: 5000
+  evaluation_depth: deep
+  enabled_evaluators: [pii, safety, groundedness, injection]
+  low_confidence_action: human_review
+  human_review_threshold: 0.40
+  block_threshold: 0.75
+  session_risk_threshold: 0.60
+  decay_factor: 0.6
+  risk_weight: 0.7
+  safety_floor: true
+  safety_floor_confidence_threshold: 0.80
+  safety_floor_categories:
+    - credential_exposure
+    - prohibited_unsafe_content
