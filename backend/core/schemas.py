@@ -7,6 +7,23 @@ RiskSignal is the canonical signal shape — never deviate from it.
 BINDING: risk_score and confidence are ALWAYS separate fields.
          severity × confidence is NEVER computed.
          evidence_status UNSUPPORTED is NEVER displayed or stored as FALSE.
+
+FIX NOTES (this revision) — see ANALYSIS_AND_FIXES.md for the full writeup:
+  - RiskSignal gained `risk_category`: a structured, exact-match field
+    (e.g. "credential_exposure", "ssn", "prohibited_unsafe_content").
+    Previously, code that needed to know a signal's specific category
+    (safety_floor.py, risk_aggregator.py) guessed it by substring-matching
+    the free-text `reason` field, which had actually gone out of sync with
+    the prose in at least one evaluator (see safety_floor.py). Every
+    evaluator now sets this field directly; downstream code no longer
+    parses prose to make decisions.
+  - UseCasePolicy / EvaluationPlan gained `high_confidence_threshold`.
+    Previously "is this signal confident enough to act on" was a single
+    hardcoded constant in decision_engine.py, shared by every use-case
+    profile — the one major decision input that WASN'T policy-driven, in a
+    system whose whole premise is context-aware, policy-driven decisions.
+    Defaults to 0.65 (the old hardcoded value) if a profile doesn't set it,
+    so existing policy.yaml files keep working unchanged.
 """
 
 from __future__ import annotations
@@ -44,6 +61,14 @@ class EvidenceStatus(str, Enum):
     """
     Epistemic boundary states (§7).
     UNSUPPORTED ≠ FALSE. UNKNOWN ≠ FALSE.
+
+    NOT_APPLICABLE is the status every pii / safety / prompt_injection
+    signal carries, since "was this supported by evidence" isn't a
+    meaningful question for a pattern match — there's nothing to verify
+    against a source document. Only the groundedness evaluator ever
+    produces SUPPORTED / CONTRADICTED / PARTIALLY_SUPPORTED / UNSUPPORTED.
+    Decision logic must treat NOT_APPLICABLE as "resolved" (not uncertain),
+    not as excluded from consideration — see decision_engine.py.
     """
     SUPPORTED = "SUPPORTED"
     CONTRADICTED = "CONTRADICTED"
@@ -91,7 +116,6 @@ def score_to_severity(score: float) -> Severity:
 class RiskSignal(BaseModel):
     """
     The canonical risk signal emitted by every evaluator (§8).
-    All 9 fields are always present.
 
     BINDING CONSTRAINTS:
       - risk_score describes severity IF the assessment is correct; independent of confidence.
@@ -100,12 +124,16 @@ class RiskSignal(BaseModel):
       - evidence_status UNSUPPORTED is NEVER equivalent to FALSE.
     """
     risk_type: str                      # pii | hallucination | safety | prompt_injection
+    risk_category: str = ""             # specific pattern/category, e.g. "credential_exposure",
+                                         # "ssn", "prohibited_unsafe_content", "ignore_previous".
+                                         # The authoritative field for category-based policy checks
+                                         # (e.g. safety-floor eligibility) — never re-derived from `reason`.
     risk_score: float = Field(ge=0.0, le=1.0)   # severity of risk IF assessment is correct
     severity: str                       # LOW | MEDIUM | HIGH | CRITICAL (from score_to_severity)
     confidence: float = Field(ge=0.0, le=1.0)   # evaluator's confidence in its OWN assessment
     evidence_status: str                # SUPPORTED | CONTRADICTED | PARTIALLY_SUPPORTED | UNSUPPORTED | NOT_APPLICABLE
     verified: bool                      # True only when sufficient trusted evidence exists
-    evidence: List[str] = []            # source snippets / citations
+    evidence: List[str] = []            # source snippets / citations — NEVER raw PII values
     overlaps_with: List[str] = []       # other risk_types this finding also implicates
     reason: str                         # human-readable explanation of the assessment
 
@@ -125,6 +153,7 @@ class UseCasePolicy(BaseModel):
     human_review_threshold: float
     block_threshold: float
     session_risk_threshold: float
+    high_confidence_threshold: float = 0.65   # policy-configurable "act on this" confidence bar
     decay_factor: float
     risk_weight: float
     safety_floor: bool
@@ -147,6 +176,7 @@ class EvaluationPlan(BaseModel):
     human_review_threshold: float
     block_threshold: float
     session_risk_threshold: float
+    high_confidence_threshold: float = 0.65
     low_confidence_action: str
     safety_floor: bool
     safety_floor_confidence_threshold: float

@@ -8,6 +8,14 @@ Two-phase check per §9:
 
 Both phases use the same detector instance (shared per §16 note).
 Returns risk_type=prompt_injection signals.
+
+FIX NOTE (this revision) — see ANALYSIS_AND_FIXES.md:
+  No functional bug found in this file specifically. Signals now carry a
+  structured `risk_category` (the pattern label, e.g. "ignore_previous")
+  for consistency with the other evaluators, and so downstream
+  audit/analytics can filter by category without parsing `reason` prose.
+  None of these categories are safety-floor-eligible today; that's a
+  policy.yaml decision if you ever want one to be.
 """
 
 from __future__ import annotations
@@ -84,8 +92,8 @@ class InjectionEvaluator(BaseEvaluator):
     Pre-flight stage: evaluates the incoming prompt.
     Output stage: evaluates the model output for injected-instruction leakage.
 
-    Pre-flight and output-stage PII checks share one pii_evaluator instance —
-    same principle applies here: one InjectionEvaluator serves both stages.
+    Pre-flight and output-stage checks share one InjectionEvaluator instance —
+    same principle as the shared PII evaluator instance.
     """
 
     @property
@@ -117,6 +125,7 @@ class InjectionEvaluator(BaseEvaluator):
 
             signals.append(RiskSignal(
                 risk_type="prompt_injection",
+                risk_category=label,
                 risk_score=risk_score,
                 severity=sev.value,
                 confidence=round(confidence, 3),

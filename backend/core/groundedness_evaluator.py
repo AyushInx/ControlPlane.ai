@@ -14,42 +14,97 @@ Implements the hallucination check via two cases:
     → confidence reflects assessment uncertainty
     → NEVER writes FALSE — reports "claim could not be verified"
 
-  Optional: AI-as-judge pass
-    → labeled "model-based heuristic assessment"
-    → can NEVER set evidence_status to SUPPORTED
-    → can only adjust confidence within the UNSUPPORTED state
-    → system is fully functional without it
+  An AI-as-judge pass is documented as a possible future extension (would
+  be labeled "model-based heuristic assessment", could never set
+  evidence_status to SUPPORTED, could only adjust confidence within the
+  UNSUPPORTED state) — it is NOT implemented in this revision, since it
+  needs an LLM client wired in that isn't part of these files. The system
+  is fully functional without it, exactly as originally documented; adding
+  it later is additive, not a required fix.
 
 BINDING:
   UNSUPPORTED ≠ FALSE.
   ControlPlane never says "no source found, therefore hallucination."
+
+FIX NOTES (this revision) — see ANALYSIS_AND_FIXES.md:
+  - The sentence-transformers model used to load at *import* time, so
+    simply importing this module paid the full model-load cost even for
+    profiles that never reach "standard"/"deep" depth (groundedness isn't
+    eligible at "fast"). It's now lazily loaded on first use.
+  - `evaluation_depth` was accepted as a parameter on `_case_a` but never
+    actually referenced anywhere in its body — "deep" and "standard"
+    evaluated identically, contradicting policy_engine's own documented
+    claim that "evaluation_depth drives real behavior — it is not just a
+    label." The per-turn claim cap (previously a fixed `[:5]`) is now
+    depth-aware: "deep" analyzes more claims per turn than "standard".
+  - Case A used to collapse every claim's findings down to a single
+    returned signal (the worst one), discarding the rest before they ever
+    reached risk_aggregator — undercutting the "all individual signals are
+    preserved" principle the rest of the system relies on. It now returns
+    one signal per evaluated claim; risk_aggregator picks the
+    representative while keeping the others for audit.
 """
 
 from __future__ import annotations
 import re
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 from backend.core.evaluator_base import BaseEvaluator, EvalContext
 from backend.core.schemas import RiskSignal, EvidenceStatus, score_to_severity
 
 # ---------------------------------------------------------------------------
-# Optional sentence-transformers import
+# Optional sentence-transformers import — library import stays eager
+# (cheap); the actual model load is lazy (see _get_st_model).
 # ---------------------------------------------------------------------------
 try:
     from sentence_transformers import SentenceTransformer, util as st_util
-    import torch
-    _ST_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
     ST_AVAILABLE = True
 except Exception:
     ST_AVAILABLE = False
-    _ST_MODEL = None
+
+_ST_MODEL = None
+_ST_MODEL_LOAD_FAILED = False
+_ST_MODEL_NAME = "all-MiniLM-L6-v2"
+
+# NLI-style classification thresholds (illustrative prototype values — §8 caveat)
+_SUPPORTED_SIMILARITY = 0.65
+_PARTIAL_SIMILARITY = 0.35
+
+# How many claims to evaluate per turn, by evaluation_depth. "deep" spends
+# more effort per turn on stronger claim-level analysis, matching what
+# policy_engine.derive_evaluation_plan documents for the "deep" tier.
+_MAX_CLAIMS_BY_DEPTH = {
+    "fast": 3,        # groundedness isn't eligible at "fast" today, kept
+                       # defined in case that ever changes.
+    "standard": 5,
+    "deep": 8,
+}
+_DEFAULT_MAX_CLAIMS = 5
+
+
+def _get_st_model():
+    """Lazily load and cache the sentence-transformers model. Returns None if unavailable."""
+    global _ST_MODEL, _ST_MODEL_LOAD_FAILED
+    if not ST_AVAILABLE or _ST_MODEL_LOAD_FAILED:
+        return None
+    if _ST_MODEL is None:
+        try:
+            _ST_MODEL = SentenceTransformer(_ST_MODEL_NAME)
+        except Exception:
+            _ST_MODEL_LOAD_FAILED = True
+            return None
+    return _ST_MODEL
+
+
+def _max_claims_for_depth(depth: str) -> int:
+    return _MAX_CLAIMS_BY_DEPTH.get(depth, _DEFAULT_MAX_CLAIMS)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _extract_claims(text: str) -> List[str]:
+def _extract_claims(text: str, max_claims: int = _DEFAULT_MAX_CLAIMS) -> List[str]:
     """
     Simple claim extraction: split on sentence boundaries.
     Returns sentences that look like factual statements (contain a verb + noun).
@@ -60,7 +115,7 @@ def _extract_claims(text: str) -> List[str]:
         s = s.strip()
         if len(s) > 20 and not s.startswith(("I ", "We ", "You ")):
             claims.append(s)
-    return claims[:5]  # cap at 5 claims to limit latency
+    return claims[:max_claims]
 
 
 def _cosine_similarity(a, b) -> float:
@@ -76,14 +131,7 @@ def _nli_classify(similarity: float, claim: str, evidence: str) -> Tuple[str, fl
     """
     Lightweight NLI-style classification using similarity + negation heuristics.
     Returns (evidence_status, confidence).
-
-    Thresholds (illustrative prototype values — §8 caveat):
-      similarity >= 0.65 → SUPPORTED
-      similarity >= 0.35 → PARTIALLY_SUPPORTED
-      similarity < 0.35  → UNSUPPORTED (not enough evidence either way)
-      + negation check   → CONTRADICTED
     """
-    # Check for negation signals in evidence relative to claim keywords
     claim_keywords = set(re.findall(r'\b\w{4,}\b', claim.lower()))
     evidence_lower = evidence.lower()
 
@@ -93,11 +141,11 @@ def _nli_classify(similarity: float, claim: str, evidence: str) -> Tuple[str, fl
     has_negation = any(re.search(p, evidence_lower) for p in negation_patterns)
     has_keyword_overlap = bool(claim_keywords & set(re.findall(r'\b\w{4,}\b', evidence_lower)))
 
-    if similarity >= 0.65:
+    if similarity >= _SUPPORTED_SIMILARITY:
         if has_negation:
             return EvidenceStatus.CONTRADICTED.value, min(0.85, similarity)
         return EvidenceStatus.SUPPORTED.value, min(0.92, similarity + 0.1)
-    elif similarity >= 0.35:
+    elif similarity >= _PARTIAL_SIMILARITY:
         if has_negation and has_keyword_overlap:
             return EvidenceStatus.CONTRADICTED.value, 0.60
         return EvidenceStatus.PARTIALLY_SUPPORTED.value, similarity
@@ -119,40 +167,31 @@ class GroundednessEvaluator(BaseEvaluator):
 
         text = context.model_output
         evidence_doc = context.trusted_evidence
-        signals: List[RiskSignal] = []
+        depth = context.plan.evaluation_depth
 
-        claims = _extract_claims(text)
+        claims = _extract_claims(text, max_claims=_max_claims_for_depth(depth))
         if not claims:
             return []
 
-        if evidence_doc and ST_AVAILABLE and _ST_MODEL is not None:
+        model = _get_st_model() if evidence_doc else None
+        if evidence_doc and model is not None:
             # ── Case A: trusted evidence available ─────────────────────────
-            signals.extend(
-                self._case_a(claims, evidence_doc, context.plan.evaluation_depth)
-            )
-        else:
-            # ── Case B: no reliable evidence ───────────────────────────────
-            signals.extend(self._case_b(claims))
+            return self._case_a(claims, evidence_doc, model)
+        # ── Case B: no reliable evidence ───────────────────────────────────
+        return self._case_b(claims)
 
-        return signals
-
-    def _case_a(
-        self,
-        claims: List[str],
-        evidence_doc: str,
-        depth: str,
-    ) -> List[RiskSignal]:
+    def _case_a(self, claims: List[str], evidence_doc: str, model) -> List[RiskSignal]:
         """
         Case A: evidence exists → embed + NLI classify.
-        Returns SUPPORTED / CONTRADICTED / PARTIALLY_SUPPORTED.
+        Returns one signal per claim — risk_aggregator picks the worst as
+        the representative while preserving the rest for audit (§10 Step 3).
         Deterministic and reproducible (primary implementation).
         """
-        # Encode claims and evidence
-        evidence_embedding = _ST_MODEL.encode(evidence_doc, convert_to_tensor=True)
-        results = []
+        evidence_embedding = model.encode(evidence_doc, convert_to_tensor=True)
+        results: List[RiskSignal] = []
 
         for claim in claims:
-            claim_embedding = _ST_MODEL.encode(claim, convert_to_tensor=True)
+            claim_embedding = model.encode(claim, convert_to_tensor=True)
             sim = _cosine_similarity(claim_embedding, evidence_embedding)
             ev_status, confidence = _nli_classify(sim, claim, evidence_doc)
 
@@ -168,6 +207,7 @@ class GroundednessEvaluator(BaseEvaluator):
 
             results.append(RiskSignal(
                 risk_type="hallucination",
+                risk_category=f"hallucination_{ev_status.lower()}",
                 risk_score=risk_score,
                 severity=score_to_severity(risk_score).value,
                 confidence=round(confidence, 3),
@@ -182,10 +222,7 @@ class GroundednessEvaluator(BaseEvaluator):
                 ),
             ))
 
-        # Return the highest-risk signal (others fold in via risk_aggregator)
-        if results:
-            return [max(results, key=lambda s: s.risk_score)]
-        return []
+        return results
 
     def _case_b(self, claims: List[str]) -> List[RiskSignal]:
         """
@@ -195,6 +232,7 @@ class GroundednessEvaluator(BaseEvaluator):
         """
         return [RiskSignal(
             risk_type="hallucination",
+            risk_category="hallucination_unsupported",
             risk_score=0.55,
             severity=score_to_severity(0.55).value,
             confidence=0.28,     # low confidence — assessment uncertainty (§9)
@@ -206,6 +244,7 @@ class GroundednessEvaluator(BaseEvaluator):
                 "Claim could not be verified against available evidence. "
                 "UNSUPPORTED ≠ FALSE — ControlPlane cannot verify this claim "
                 "either way without a trusted source document (§7, §9 Case B). "
-                f"Claim sample: '{claims[0][:100] if claims else 'N/A'}...'"
+                f"Claim sample: '{claims[0][:100] if claims else 'N/A'}...' "
+                f"({len(claims)} claim(s) evaluated)."
             ),
         )]

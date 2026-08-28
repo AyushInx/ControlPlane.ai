@@ -14,17 +14,32 @@ BINDING:
 Formula (§13):
   weighted_turn_risk = risk_score × risk_weight
   session_risk_new = min(1.0, session_risk_old × decay_factor + weighted_turn_risk)
+
+FIX NOTES (this revision) — see ANALYSIS_AND_FIXES.md:
+  This file's actual risk math was already correct and fully policy-driven
+  — no formula changes here. Two small robustness fixes:
+  - `import json` was done locally inside two functions; moved to the
+    top-level imports (no behavior change, just tidiness).
+  - get_or_create_session had a classic read-then-write race: two
+    concurrent requests for the same brand-new session_id could both pass
+    the "not found" check and both try to insert. It now catches the
+    failure, rolls back, and re-fetches, so whichever request actually won
+    the insert becomes the session both callers see, instead of one
+    request crashing with an integrity error.
+  Removed an unused `get_db_session` import — nothing in this file called
+  it (it looked like a leftover re-export; import it directly from
+  backend.db.database wherever it's actually needed).
 """
 
 from __future__ import annotations
-import uuid
+import json
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
 from sqlalchemy.orm import Session as DBSession
 
 from backend.core.schemas import EvaluationPlan, SessionUpdateResult
-from backend.db.database import SessionModel, get_db_session
+from backend.db.database import SessionModel
 
 
 def _now_iso() -> str:
@@ -42,19 +57,31 @@ def get_or_create_session(
 ) -> SessionModel:
     """Load existing session or create a new one at session_risk=0.0."""
     record = db.query(SessionModel).filter(SessionModel.session_id == session_id).first()
-    if record is None:
-        record = SessionModel(
-            session_id=session_id,
-            profile=profile,
-            session_risk=0.0,
-            turn_count=0,
-            history="[]",
-            created_at=_now_iso(),
-            updated_at=_now_iso(),
-        )
-        db.add(record)
+    if record is not None:
+        return record
+
+    record = SessionModel(
+        session_id=session_id,
+        profile=profile,
+        session_risk=0.0,
+        turn_count=0,
+        history="[]",
+        created_at=_now_iso(),
+        updated_at=_now_iso(),
+    )
+    db.add(record)
+    try:
         db.commit()
-        db.refresh(record)
+    except Exception:
+        # Another concurrent request created this session_id first.
+        # Fall back to reading what it created instead of raising.
+        db.rollback()
+        record = db.query(SessionModel).filter(SessionModel.session_id == session_id).first()
+        if record is None:
+            raise
+        return record
+
+    db.refresh(record)
     return record
 
 
@@ -74,8 +101,6 @@ def update_session_risk(
 
     All parameters from plan (policy config), not hardcoded.
     """
-    import json
-
     record = get_or_create_session(session_id, profile, db)
     session_risk_before = record.session_risk
 
@@ -117,7 +142,6 @@ def update_session_risk(
 
 def get_session_state(session_id: str, db: DBSession) -> Optional[Dict[str, Any]]:
     """Return full session state dict for API /sessions/{session_id}."""
-    import json
     record = db.query(SessionModel).filter(SessionModel.session_id == session_id).first()
     if record is None:
         return None

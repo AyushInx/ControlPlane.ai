@@ -20,7 +20,7 @@ pip install spacy
 python -m spacy download en_core_web_sm
 ```
 
-> **Note:** `sentence-transformers` downloads `all-MiniLM-L6-v2` (~90MB) on first run for groundedness Case A evaluation. The system fully functions without it (falls back to Case B/UNSUPPORTED).
+> **Note:** Both `sentence-transformers` and `spacy` are lazy-loaded on first use to ensure fast cold starts and zero overhead for profiles that don't need them. The system fully functions without them.
 
 ### 2. Start both servers
 
@@ -71,7 +71,7 @@ ControlPanel.ai/
 │   ├── config/
 │   │   └── policy.yaml            # Versioned policy (§6)
 │   ├── core/
-│   │   ├── schemas.py             # RiskSignal (9 fields), AuditRecord (15), ReviewQueueItem (11)
+│   │   ├── schemas.py             # RiskSignal (10 fields), AuditRecord (15), ReviewQueueItem (11)
 │   │   ├── policy_engine.py       # CORE 1 — loads policy, derives EvaluationPlan
 │   │   ├── evaluator_base.py      # Shared evaluator interface
 │   │   ├── pii_evaluator.py       # PII: regex (high conf) + spaCy NER (optional)
@@ -99,13 +99,14 @@ ControlPanel.ai/
 
 | Constraint | Enforcement |
 |---|---|
-| No hardcoded per-profile branches | `policy_engine.py` reads config only |
+| No hardcoded per-profile branches | `policy_engine.py` reads config only (and hot-reloads on edits) |
 | `severity` × `confidence` = never | Separate fields, never multiplied anywhere |
 | UNSUPPORTED ≠ FALSE | Never stored or displayed as FALSE |
 | PII ≠ auto-Block | Routine PII follows normal policy |
+| Safety Floor is Policy-Driven | `safety_floor.py` checks exact `risk_category` against policy |
 | All evaluators → same §8 schema | `BaseEvaluator` enforces interface |
 | Every decision → full audit record | `audit_logger.py` always writes all 15 fields |
-| Aggregation preserves individual signals | `risk_aggregator.py` never sums |
+| Aggregation preserves individual signals | `risk_aggregator.py` never sums and retains all claims |
 | Session risk from config formula | `session_tracker.py` reads decay_factor, risk_weight from policy |
 | Demos are deterministic | All inputs hardcoded in `scenarios.py` |
 | System runs without AI judge | `groundedness_evaluator.py` fully functional in Case B |

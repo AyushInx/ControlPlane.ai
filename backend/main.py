@@ -127,6 +127,10 @@ def run_pipeline(
         preflight_signals.extend(
             _EVALUATORS["pii"].evaluate(ctx, stage="preflight")
         )
+    if "safety" in plan.enabled_evaluators:
+        preflight_signals.extend(
+            _EVALUATORS["safety"].evaluate(ctx, stage="preflight")
+        )
 
     # ── Output evaluation ───────────────────────────────────────────────────
     output_signals = []

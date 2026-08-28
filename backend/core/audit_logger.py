@@ -4,17 +4,25 @@ audit_logger.py — CORE 4: Full Audit Logger (§15)
 Writes a complete audit record for every decision.
 Every field from §15 worked example is present.
 Every decision must be answerable with "why did ControlPlane make this decision?"
+
+FIX NOTE (this revision) — see ANALYSIS_AND_FIXES.md:
+  Small cleanups only: the "no dominant signal" fallback used a bare
+  "NOT_APPLICABLE" string literal instead of EvidenceStatus.NOT_APPLICABLE.value
+  (harmless today since they're equal, but one typo away from silently
+  diverging from the schema); `profile`/`action` filters were typed as
+  `str = None`, which Optional[str] now says correctly; and an unused
+  `RiskSignal` import was removed.
 """
 
 from __future__ import annotations
 import json
-from typing import List
+from typing import List, Optional
 
 from sqlalchemy.orm import Session as DBSession
 
 from backend.core.schemas import (
-    AuditRecord, RiskSignal, DecisionResult, AggregatedResult,
-    SessionUpdateResult, EvaluationPlan
+    AuditRecord, DecisionResult, AggregatedResult,
+    SessionUpdateResult, EvaluationPlan, EvidenceStatus,
 )
 from backend.db.database import AuditLogModel
 
@@ -43,7 +51,7 @@ def write_audit_record(
     """
     dominant = aggregated.dominant_signal
     confidence = dominant.confidence if dominant else 0.0
-    evidence_status = dominant.evidence_status if dominant else "NOT_APPLICABLE"
+    evidence_status = dominant.evidence_status if dominant else EvidenceStatus.NOT_APPLICABLE.value
 
     record = AuditRecord(
         timestamp=timestamp,
@@ -91,8 +99,8 @@ def get_audit_log(
     db: DBSession,
     limit: int = 50,
     offset: int = 0,
-    profile: str = None,
-    action: str = None,
+    profile: Optional[str] = None,
+    action: Optional[str] = None,
 ) -> List[dict]:
     """Return paginated audit records from the database."""
     query = db.query(AuditLogModel)

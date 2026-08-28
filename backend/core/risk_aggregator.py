@@ -9,14 +9,30 @@ BINDING:
   - Aggregation preserves individual signals — never a blind sum.
   - overlaps_with signals are LINKED, not merged.
   - The aggregated result is a decision-support signal, not a calibrated probability of harm.
+
+FIX NOTES (this revision) — see ANALYSIS_AND_FIXES.md:
+  - Step 6 used to re-implement its own version of "is this a safety-floor
+    category", separate from (and subtly different than) safety_floor.py's
+    version — including a check for the literal string "credential_exposure"
+    that pii_evaluator never actually produces, so it never matched. That
+    meant AggregatedResult.safety_floor_triggered could say False even when
+    decision_engine's Rule 1 (which uses the real, correct check) was about
+    to fire — an audit trail that disagreed with the actual decision. Step
+    6 now imports and calls the exact same safety_floor.is_safety_floor_category()
+    that Rule 1 uses, so the two can't drift apart again.
+  - _annotate_overlaps only ever linked one hardcoded pair
+    (hallucination, pii). It now walks a small, documented list of
+    known-related risk-type pairs — easy to extend without touching the
+    aggregation logic itself.
 """
 
 from __future__ import annotations
-from typing import List, Optional, Dict
+from typing import List, Dict, FrozenSet
 
 from backend.core.schemas import (
-    RiskSignal, AggregatedResult, EvaluationPlan, score_to_severity, Severity
+    RiskSignal, AggregatedResult, EvaluationPlan, Severity
 )
+from backend.core.safety_floor import is_safety_floor_category
 
 
 # ---------------------------------------------------------------------------
@@ -32,6 +48,17 @@ _SEVERITY_ORDER = {
 
 def _severity_rank(sev: str) -> int:
     return _SEVERITY_ORDER.get(sev, 0)
+
+
+# Known relationships between risk types: when both are present in the same
+# evaluation, they're treated as linked (not merged) findings — resolving
+# one may address the other. Extend this list as new relationships are
+# identified; nothing else in aggregate() needs to change.
+_RELATED_RISK_TYPE_PAIRS: List[FrozenSet[str]] = [
+    frozenset({"hallucination", "pii"}),         # e.g. a fabricated personal detail
+    frozenset({"safety", "prompt_injection"}),   # e.g. a jailbreak eliciting unsafe output
+    frozenset({"pii", "safety"}),                # e.g. exposing someone's info as harassment
+]
 
 
 # ---------------------------------------------------------------------------
@@ -80,10 +107,10 @@ def aggregate(signals: List[RiskSignal], plan: EvaluationPlan) -> AggregatedResu
     # ── Step 3: Preserve highest severity per risk_type ─────────────────────
     # Never average or sum away — only the highest-severity signal per type is
     # the representative, but ALL signals from all types are preserved.
-    representative_per_type: Dict[str, RiskSignal] = {}
-    for rtype, sigs in grouped.items():
-        # Pick signal with highest risk_score within this type
-        representative_per_type[rtype] = max(sigs, key=lambda s: s.risk_score)
+    representative_per_type: Dict[str, RiskSignal] = {
+        rtype: max(sigs, key=lambda s: s.risk_score)
+        for rtype, sigs in grouped.items()
+    }
 
     # ── Step 4: confidence preserved separately (never multiplied) ───────────
     # This is enforced in the schema — no collapse happens here.
@@ -93,33 +120,26 @@ def aggregate(signals: List[RiskSignal], plan: EvaluationPlan) -> AggregatedResu
     dominant = max(representative_per_type.values(), key=lambda s: s.risk_score)
 
     # ── Step 6: Apply Safety Floor check ─────────────────────────────────────
+    # Single source of truth with decision_engine's Rule 1 (see safety_floor.py)
+    # so this flag can never disagree with the actual decision that gets made.
     safety_floor_triggered = False
     if plan.safety_floor:
-        for sig in signals:
-            is_sf_category = (
-                sig.risk_type == "pii" and "credential_exposure" in sig.reason
-            ) or (
-                sig.risk_type == "safety" and any(
-                    cat in sig.reason
-                    for cat in plan.safety_floor_categories
-                )
-            )
-            if (
-                is_sf_category
-                and sig.severity == Severity.CRITICAL.value
-                and sig.confidence >= plan.safety_floor_confidence_threshold
-            ):
-                safety_floor_triggered = True
-                # Safety floor dominant overrides
-                dominant = sig
-                break
+        floor_candidates = [
+            sig for sig in signals
+            if sig.severity == Severity.CRITICAL.value
+            and sig.confidence >= plan.safety_floor_confidence_threshold
+            and is_safety_floor_category(sig, plan)
+        ]
+        if floor_candidates:
+            safety_floor_triggered = True
+            dominant = max(floor_candidates, key=lambda s: (s.risk_score, s.confidence))
 
     # ── Step 7: Produce explainable decision ─────────────────────────────────
     aggregated_severity = dominant.severity
     other_types = [t for t in representative_per_type if t != dominant.risk_type]
 
     explanation_parts = [
-        f"Dominant signal: risk_type={dominant.risk_type}, "
+        f"Dominant signal: risk_type={dominant.risk_type}, risk_category={dominant.risk_category}, "
         f"risk_score={dominant.risk_score:.2f}, severity={dominant.severity}, "
         f"confidence={dominant.confidence:.2f}, "
         f"evidence_status={dominant.evidence_status}."
@@ -152,15 +172,18 @@ def _annotate_overlaps(
     representative_per_type: Dict[str, RiskSignal],
 ) -> None:
     """
-    Annotate overlaps_with for signals that share the same source finding.
-    Demo 4: hallucination + privacy on a fabricated personal detail.
-    Both are linked — resolving one is understood to address both.
+    Annotate overlaps_with for signals whose risk types are known to be
+    related (see _RELATED_RISK_TYPE_PAIRS) and both present in this
+    evaluation. Linked, not merged — resolving one is understood to
+    potentially address the other.
     """
-    all_types = list(representative_per_type.keys())
-    # If hallucination and pii both present, link them
-    if "hallucination" in all_types and "pii" in all_types:
+    present_types = set(representative_per_type.keys())
+    for pair in _RELATED_RISK_TYPE_PAIRS:
+        if not pair.issubset(present_types):
+            continue
+        type_a, type_b = tuple(pair)
         for sig in signals:
-            if sig.risk_type == "hallucination" and "pii" not in sig.overlaps_with:
-                sig.overlaps_with.append("pii")
-            elif sig.risk_type == "pii" and "hallucination" not in sig.overlaps_with:
-                sig.overlaps_with.append("hallucination")
+            if sig.risk_type == type_a and type_b not in sig.overlaps_with:
+                sig.overlaps_with.append(type_b)
+            elif sig.risk_type == type_b and type_a not in sig.overlaps_with:
+                sig.overlaps_with.append(type_a)
